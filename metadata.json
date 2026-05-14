@@ -1,0 +1,6 @@
+{
+  "name": "Hybrid OAN Dashboard",
+  "description": "Occluded Face Recognition using ResNet-50 and DE-GAN",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

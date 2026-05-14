@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-multipart
+opencv-python
+numpy
+facenet-pytorch
+Pillow
+httpx
+torch
+torchvision
+scikit-learn
+scikit-image
+matplotlib
+
+lpips
+scikit-learn
+scikit-image
