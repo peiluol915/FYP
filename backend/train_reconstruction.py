@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -13,12 +14,24 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import models as tv_models, transforms
 
 try:
-    from models import DEGAN, PatchDiscriminator
+    from models import DEGAN, MTRUNet, PatchDiscriminator
 except ModuleNotFoundError:
-    from backend.models import DEGAN, PatchDiscriminator
+    from backend.models import DEGAN, MTRUNet, PatchDiscriminator
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MOUTH_CHIN_MASK_RESTRICT_ENABLED_DEFAULT = True
+
+
+def _str_to_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("Expected true or false.")
 
 
 class SyntheticFaceOcclusionAugmentor:
@@ -36,14 +49,16 @@ class SyntheticFaceOcclusionAugmentor:
     def _sample_occluder_color(self, rng: np.random.Generator, style: str) -> np.ndarray:
         if style == "opaque-panel":
             palette = (
-                np.array([68.0, 92.0, 124.0], dtype=np.float32),
-                np.array([104.0, 120.0, 138.0], dtype=np.float32),
+                np.array([226.0, 218.0, 206.0], dtype=np.float32),
+                np.array([216.0, 203.0, 190.0], dtype=np.float32),
+                np.array([196.0, 174.0, 154.0], dtype=np.float32),
+                np.array([168.0, 140.0, 112.0], dtype=np.float32),
                 np.array([132.0, 144.0, 156.0], dtype=np.float32),
                 np.array([156.0, 164.0, 172.0], dtype=np.float32),
             )
             base = palette[int(rng.integers(0, len(palette)))]
             jitter = rng.uniform(-16.0, 16.0, size=3).astype(np.float32)
-            return np.clip(base + jitter, 54.0, 188.0)
+            return np.clip(base + jitter, 54.0, 238.0)
         if style == "side-occlusion":
             base = np.full(3, rng.uniform(70, 170), dtype=np.float32)
             return np.clip(base + rng.uniform(-18.0, 18.0, size=3).astype(np.float32), 48.0, 188.0)
@@ -127,10 +142,10 @@ class SyntheticFaceOcclusionAugmentor:
 
     def _draw_opaque_panel(self, image_rgb: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
         h, w = image_rgb.shape[:2]
-        x1 = int(w * rng.uniform(0.18, 0.32))
-        x2 = int(w * rng.uniform(0.68, 0.84))
-        y1 = int(h * rng.uniform(0.28, 0.42))
-        y2 = int(h * rng.uniform(0.66, 0.84))
+        x1 = int(w * rng.uniform(0.16, 0.34))
+        x2 = int(w * rng.uniform(0.64, 0.86))
+        y1 = int(h * rng.uniform(0.31, 0.49))
+        y2 = int(h * rng.uniform(0.61, 0.84))
         mask_u8 = np.zeros((h, w), dtype=np.uint8)
         cv2.rectangle(mask_u8, (x1, y1), (x2, y2), 255, thickness=-1)
         panel = self._sample_occluder_color(rng, "opaque-panel")
@@ -138,11 +153,22 @@ class SyntheticFaceOcclusionAugmentor:
             image_rgb,
             mask_u8,
             panel,
-            opacity=float(rng.uniform(0.78, 0.96)),
-            blur_kernel=9,
+            opacity=float(rng.uniform(0.86, 1.0)),
+            blur_kernel=5,
         )
         outline = tuple(int(channel) for channel in np.clip(panel * 0.82, 40.0, 170.0))
         cv2.rectangle(image_rgb, (x1, y1), (x2, y2), outline, thickness=1)
+        if rng.random() < 0.65:
+            line_color = tuple(int(channel) for channel in np.clip(panel * rng.uniform(0.45, 0.78), 28.0, 190.0))
+            if rng.random() < 0.5:
+                cv2.line(image_rgb, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2), line_color, 1, cv2.LINE_AA)
+            else:
+                cv2.line(image_rgb, (x1 + 2, y2 - 2), (x2 - 2, y1 + 2), line_color, 1, cv2.LINE_AA)
+        if rng.random() < 0.45:
+            strap_color = tuple(int(channel) for channel in np.clip(panel * 0.75 + 28.0, 60.0, 220.0))
+            y_mid = int((y1 + y2) * 0.5)
+            cv2.line(image_rgb, (max(0, x1 - int(w * 0.12)), y_mid + int(rng.uniform(-5, 5))), (x1, y_mid), strap_color, 1, cv2.LINE_AA)
+            cv2.line(image_rgb, (x2, y_mid), (min(w - 1, x2 + int(w * 0.12)), y_mid + int(rng.uniform(-5, 5))), strap_color, 1, cv2.LINE_AA)
         return image_rgb, soft_mask
 
     def _draw_side_occlusion(self, image_rgb: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -287,10 +313,16 @@ class MaskedFacePairDataset(Dataset):
         filter_extra_originals: bool = True,
         match_extra_illumination: bool = True,
         indices: list[int] | None = None,
+        image_size: int = 112,
+        restrict_mouth_chin_mask: bool = MOUTH_CHIN_MASK_RESTRICT_ENABLED_DEFAULT,
     ):
         self.masked_root = Path(masked_root)
         self.original_root = Path(original_root)
         self.mask_threshold = mask_threshold
+        if image_size % 8 != 0:
+            raise ValueError("image_size must be divisible by 8 because DEGAN uses three down/up-sampling stages.")
+        self.image_size = int(image_size)
+        self.restrict_mouth_chin_mask = restrict_mouth_chin_mask
         self.synthetic_probability = float(np.clip(synthetic_probability, 0.0, 1.0))
         self.synthetic_mode = synthetic_mode
         self.extra_masked_roots = [Path(root) for root in (extra_masked_roots or [])]
@@ -300,7 +332,7 @@ class MaskedFacePairDataset(Dataset):
         self.match_extra_illumination = match_extra_illumination
         self.transform = transforms.Compose(
             [
-                transforms.Resize((112, 112)),
+                transforms.Resize((self.image_size, self.image_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
@@ -336,25 +368,34 @@ class MaskedFacePairDataset(Dataset):
 
     def _collect_extra_originals(self) -> list[Path]:
         collected: list[Path] = []
+        seen: set[Path] = set()
+        cap = self.max_extra_originals if self.max_extra_originals is not None and self.max_extra_originals >= 0 else None
         for root in self.extra_original_roots:
             if not root.exists():
                 print(f"Skipping extra original dataset because it was not found: {root}")
                 continue
             for image_path in root.rglob("*"):
+                if cap is not None and len(collected) >= cap:
+                    break
                 if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
+                    if image_path in seen:
+                        continue
                     if self.filter_extra_originals and not self._is_usable_extra_original(image_path):
                         continue
                     collected.append(image_path)
-        unique = sorted(set(collected))
-        if self.max_extra_originals is not None and self.max_extra_originals >= 0:
-            unique = unique[: self.max_extra_originals]
-        return unique
+                    seen.add(image_path)
+            if cap is not None and len(collected) >= cap:
+                break
+        return sorted(collected)
 
     def _estimate_reference_luminance(self, sample_limit: int = 512) -> tuple[float, float]:
         luminance_means: list[float] = []
         for _, original_path in self.samples[:sample_limit]:
             try:
-                original = Image.open(original_path).convert("RGB").resize((112, 112), Image.Resampling.BILINEAR)
+                original = Image.open(original_path).convert("RGB").resize(
+                    (self.image_size, self.image_size),
+                    Image.Resampling.BILINEAR,
+                )
             except Exception:
                 continue
             y_channel = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2YCrCb)[:, :, 0]
@@ -365,7 +406,10 @@ class MaskedFacePairDataset(Dataset):
 
     def _brightness_metrics(self, image_path: Path) -> tuple[float, float]:
         with Image.open(image_path).convert("RGB") as img:
-            arr = np.array(img.resize((112, 112), Image.Resampling.BILINEAR), dtype=np.uint8)
+            arr = np.array(
+                img.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR),
+                dtype=np.uint8,
+            )
         mean_luma = float(cv2.cvtColor(arr, cv2.COLOR_RGB2YCrCb)[:, :, 0].mean())
         highlight_fraction = float((arr.mean(axis=2) > 235).mean())
         return mean_luma, highlight_fraction
@@ -415,10 +459,12 @@ class MaskedFacePairDataset(Dataset):
         soft_diff = torch.clamp((diff_map - self.mask_threshold) / max(self.mask_threshold, 1e-6), min=0.0, max=1.0)
         occlusion_mask = soft_diff.unsqueeze(0)
         occlusion_mask = F.max_pool2d(occlusion_mask, kernel_size=7, stride=1, padding=3).squeeze(0)
+        if self.restrict_mouth_chin_mask:
+            occlusion_mask = _restrict_mask_to_mouth_chin(occlusion_mask.unsqueeze(0)).squeeze(0)
         return masked_tensor, original_tensor, occlusion_mask
 
     def _synthetic_sample(self, original: Image.Image, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        original_resized = original.resize((112, 112), Image.Resampling.BILINEAR)
+        original_resized = original.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
         original_rgb = np.array(original_resized.convert("RGB"))
         original_rgb = self._match_reference_illumination(original_rgb)
         seed = (torch.initial_seed() + index * 7919) % (2**32)
@@ -428,6 +474,8 @@ class MaskedFacePairDataset(Dataset):
         masked_tensor = self.transform(Image.fromarray(masked_rgb))
         original_tensor = self.transform(Image.fromarray(original_rgb))
         occlusion_tensor = torch.from_numpy(occlusion_mask).float().unsqueeze(0)
+        if self.restrict_mouth_chin_mask:
+            occlusion_tensor = _restrict_mask_to_mouth_chin(occlusion_tensor.unsqueeze(0)).squeeze(0)
         return masked_tensor, original_tensor, occlusion_tensor
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -452,8 +500,12 @@ class MaskedFacePairDataset(Dataset):
 
 
 def _masked_average(error: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if mask.shape[1] == 1 and error.shape[1] != 1:
+        mask = mask.expand(-1, error.shape[1], -1, -1)
+    elif mask.shape[1] != error.shape[1]:
+        mask = mask.mean(dim=1, keepdim=True).expand(-1, error.shape[1], -1, -1)
     weighted_error = error * mask
-    denom = mask.sum(dim=(1, 2, 3), keepdim=False) * error.shape[1]
+    denom = mask.sum(dim=(1, 2, 3), keepdim=False)
     denom = denom.clamp_min(eps)
     return weighted_error.sum(dim=(1, 2, 3)) / denom
 
@@ -469,6 +521,41 @@ def _expand_mask(mask: torch.Tensor, channels: int) -> torch.Tensor:
     if mask.shape[1] == channels:
         return mask
     return mask.expand(-1, channels, -1, -1)
+
+
+def _mouth_chin_roi_like(mask: torch.Tensor) -> torch.Tensor:
+    h, w = mask.shape[-2:]
+    roi = torch.zeros_like(mask)
+    y1 = max(0, int(round(0.30 * h)))
+    y2 = min(h, int(round(0.84 * h)))
+    x1 = max(0, int(round(0.10 * w)))
+    x2 = min(w, int(round(0.90 * w)))
+    roi[:, :, y1:y2, x1:x2] = 1.0
+    return roi
+
+
+def _restrict_mask_to_mouth_chin(mask: torch.Tensor) -> torch.Tensor:
+    restricted = mask.clamp(0.0, 1.0) * _mouth_chin_roi_like(mask)
+    original_area = mask.sum(dim=(1, 2, 3), keepdim=True)
+    restricted_area = restricted.sum(dim=(1, 2, 3), keepdim=True)
+    # Keep non-lower-face training cases usable if the caller still trains mixed occlusions.
+    keep_original = (original_area > 20.0) & (restricted_area < original_area * 0.18)
+    return torch.where(keep_original, mask.clamp(0.0, 1.0), restricted)
+
+
+def _harden_mask(mask: torch.Tensor, threshold: float = 0.03) -> torch.Tensor:
+    hard_mask = (mask > threshold).to(mask.dtype)
+    hard_mask = F.max_pool2d(hard_mask, kernel_size=7, stride=1, padding=3)
+    hard_mask = F.max_pool2d(hard_mask, kernel_size=5, stride=1, padding=2)
+    return hard_mask.clamp(0.0, 1.0)
+
+
+def _sanitize_masked_input(masked_inputs: torch.Tensor, occlusion_masks: torch.Tensor) -> torch.Tensor:
+    hard_mask = _expand_mask(_harden_mask(occlusion_masks), masked_inputs.shape[1])
+    local_mean = F.avg_pool2d(masked_inputs * (1.0 - hard_mask), kernel_size=17, stride=1, padding=8)
+    local_count = F.avg_pool2d(1.0 - hard_mask, kernel_size=17, stride=1, padding=8).clamp_min(1e-3)
+    fill = (local_mean / local_count).clamp(-1.0, 1.0)
+    return masked_inputs * (1.0 - hard_mask) + fill * hard_mask
 
 
 def _gradient_map(image: torch.Tensor) -> torch.Tensor:
@@ -488,6 +575,17 @@ def _gradient_map(image: torch.Tensor) -> torch.Tensor:
     grad_x = F.conv2d(image, sobel_x, padding=1, groups=channels)
     grad_y = F.conv2d(image, sobel_y, padding=1, groups=channels)
     return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+
+
+def _laplacian_map(image: torch.Tensor) -> torch.Tensor:
+    channels = image.shape[1]
+    kernel = torch.tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+        device=image.device,
+        dtype=image.dtype,
+    ).view(1, 1, 3, 3)
+    kernel = kernel.expand(channels, 1, 3, 3)
+    return F.conv2d(image, kernel, padding=1, groups=channels)
 
 
 def _ssim_loss(
@@ -557,11 +655,48 @@ class PerceptualLoss(nn.Module):
         return F.l1_loss(self.vgg(self._prepare(prediction)), self.vgg(self._prepare(target.detach())))
 
 
+def _masked_perceptual_focus(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    perceptual_loss_fn: PerceptualLoss,
+) -> torch.Tensor:
+    """Apply VGG loss mainly to the hidden region without losing face context."""
+    mask = mask.clamp(0.0, 1.0)
+    mask_rgb = _expand_mask(mask, prediction.shape[1])
+    # Keep a little neutral context around the hole; pure black outside the
+    # mask makes VGG chase artificial boundaries instead of facial structure.
+    neutral = torch.zeros_like(prediction)
+    prediction_focus = prediction * mask_rgb + neutral * (1.0 - mask_rgb)
+    target_focus = target.detach() * mask_rgb + neutral * (1.0 - mask_rgb)
+    return perceptual_loss_fn(prediction_focus, target_focus)
+
+
 def _tensor_to_rgb_uint8(tensor: torch.Tensor) -> np.ndarray:
     """Convert a [-1,1] tensor to a [H,W,3] uint8 RGB image."""
     img = tensor.detach().cpu().clamp(-1.0, 1.0)
     img = ((img + 1.0) * 127.5).squeeze(0).permute(1, 2, 0).numpy()
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _forward_reconstruction(
+    model: DEGAN,
+    masked_inputs: torch.Tensor,
+    occlusion_masks: torch.Tensor,
+    refiner: MTRUNet | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hard_masks = _harden_mask(occlusion_masks)
+    mask_rgb = _expand_mask(hard_masks, masked_inputs.shape[1])
+    sanitized_inputs = _sanitize_masked_input(masked_inputs, occlusion_masks)
+    if refiner is None:
+        predicted = model(sanitized_inputs, hard_masks)
+        blended = masked_inputs * (1.0 - mask_rgb) + predicted * mask_rgb
+        return blended, predicted
+
+    with torch.no_grad():
+        predicted = model(sanitized_inputs, hard_masks)
+    refined = refiner(masked_inputs, predicted.detach(), hard_masks)
+    return refined, predicted
 
 
 def _save_epoch_samples(
@@ -571,10 +706,17 @@ def _save_epoch_samples(
     epoch: int,
     output_dir: Path,
     max_samples: int = 6,
+    refiner: MTRUNet | None = None,
 ) -> None:
-    """Save a visual grid comparing occluded -> mask -> reconstruction -> ground truth."""
+    """Save per-epoch raw generator outputs and Original/Masked/Raw/Blended grids."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    raw_output_dir = output_dir / "raw_generator_outputs" / f"epoch_{epoch + 1:03d}"
+    raw_output_dir.mkdir(parents=True, exist_ok=True)
+    model_was_training = model.training
+    refiner_was_training = refiner.training if refiner is not None else False
     model.eval()
+    if refiner is not None:
+        refiner.eval()
     rows = []
     count = 0
 
@@ -584,37 +726,46 @@ def _save_epoch_samples(
             original_targets = original_targets.to(device)
             occlusion_masks = occlusion_masks.to(device)
 
-            predicted = model(masked_inputs, occlusion_masks)
-            mask_rgb = _expand_mask(occlusion_masks.clamp(0.0, 1.0), 3)
-            blended = masked_inputs * (1.0 - mask_rgb) + predicted * mask_rgb
+            blended, predicted = _forward_reconstruction(model, masked_inputs, occlusion_masks, refiner)
+            hard_masks = _harden_mask(occlusion_masks)
 
             for j in range(masked_inputs.shape[0]):
                 if count >= max_samples:
                     break
-                inp = _tensor_to_rgb_uint8(masked_inputs[j])
-                tgt = _tensor_to_rgb_uint8(original_targets[j])
-                rec = _tensor_to_rgb_uint8(blended[j])
-                # Mask heatmap
-                m = occlusion_masks[j, 0].cpu().numpy()
-                m_vis = cv2.applyColorMap(
-                    np.clip(m * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_JET
+                original = _tensor_to_rgb_uint8(original_targets[j])
+                masked = _tensor_to_rgb_uint8(masked_inputs[j])
+                raw = _tensor_to_rgb_uint8(predicted[j])
+                hard_mask_rgb = _expand_mask(hard_masks[j:j + 1], masked_inputs.shape[1])
+                region_only = _tensor_to_rgb_uint8(
+                    masked_inputs[j:j + 1] * (1.0 - hard_mask_rgb)
+                    + predicted[j:j + 1] * hard_mask_rgb
                 )
-                m_vis = cv2.cvtColor(m_vis, cv2.COLOR_BGR2RGB)
-                row = np.hstack([inp, m_vis, rec, tgt])
+                rec = _tensor_to_rgb_uint8(blended[j])
+                diff = np.clip(np.abs(rec.astype(np.float32) - original.astype(np.float32)) * 3.0, 0, 255).astype(np.uint8)
+                cv2.imwrite(
+                    str(raw_output_dir / f"raw_{count + 1:02d}.png"),
+                    cv2.cvtColor(raw, cv2.COLOR_RGB2BGR),
+                )
+                row = np.hstack([original, masked, raw, region_only, rec, diff])
                 rows.append(row)
                 count += 1
             if count >= max_samples:
                 break
 
-    model.train()
+    if refiner is not None:
+        if refiner_was_training:
+            refiner.train()
+        model.eval()
+    elif model_was_training:
+        model.train()
     if not rows:
         return
 
     # Add column headers on first row
     h, w = rows[0].shape[:2]
     header = np.zeros((20, w, 3), dtype=np.uint8)
-    col_w = w // 4
-    for idx, label in enumerate(["Occluded", "Mask", "Reconstructed", "Ground Truth"]):
+    col_w = w // 6
+    for idx, label in enumerate(["Original", "Masked", "Raw GAN", "Region Only", "Final Blend", "Difference"]):
         cv2.putText(header, label, (idx * col_w + 4, 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
@@ -624,7 +775,7 @@ def _save_epoch_samples(
     print(f"  Saved training samples -> {out_path}")
 
 
-def _load_partial_checkpoint(model: DEGAN, checkpoint_path: str | None, device: torch.device) -> bool:
+def _load_partial_checkpoint(model: nn.Module, checkpoint_path: str | None, device: torch.device) -> bool:
     if not checkpoint_path:
         return False
 
@@ -633,7 +784,10 @@ def _load_partial_checkpoint(model: DEGAN, checkpoint_path: str | None, device: 
         print(f"Checkpoint not found, starting from scratch: {path}")
         return False
 
-    state_dict = torch.load(path, map_location=device)
+    try:
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(path, map_location=device)
     model_state = model.state_dict()
     compatible_state = {
         key: value
@@ -646,8 +800,24 @@ def _load_partial_checkpoint(model: DEGAN, checkpoint_path: str | None, device: 
 
     model_state.update(compatible_state)
     model.load_state_dict(model_state, strict=False)
-    print(f"Warm-started DEGAN from {path} with {len(compatible_state)} compatible tensors.")
+    print(f"Warm-started {model.__class__.__name__} from {path} with {len(compatible_state)} compatible tensors.")
     return True
+
+
+def _total_variation_loss(image: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    tv_h = (image[:, :, 1:, :] - image[:, :, :-1, :]).abs()
+    tv_w = (image[:, :, :, 1:] - image[:, :, :, :-1]).abs()
+    if mask is None:
+        return tv_h.mean() + tv_w.mean()
+    mask = mask.clamp(0.0, 1.0)
+    mask_h = _expand_mask(mask[:, :, 1:, :], image.shape[1])
+    mask_w = _expand_mask(mask[:, :, :, 1:], image.shape[1])
+    return _masked_average(tv_h, mask_h).mean() + _masked_average(tv_w, mask_w).mean()
+
+
+def _masked_discriminator_view(image: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_rgb = _expand_mask(_harden_mask(mask), image.shape[1])
+    return image * mask_rgb + target.detach() * (1.0 - mask_rgb)
 
 
 def _compute_reconstruction_losses(
@@ -666,10 +836,16 @@ def _compute_reconstruction_losses(
     perceptual_weight: float = 0.0,
     discriminator: PatchDiscriminator | None = None,
     adversarial_weight: float = 0.0,
+    refiner: MTRUNet | None = None,
+    tv_weight: float = 0.0,
+    detail_weight: float = 0.0,
+    outside_weight: float = 1.0,
+    teacher_identity_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    predicted_face = model(masked_inputs, occlusion_masks)
-    mask_rgb = _expand_mask(occlusion_masks.clamp(0.0, 1.0), masked_inputs.shape[1])
-    blended_outputs = masked_inputs * (1.0 - mask_rgb) + predicted_face * mask_rgb
+    hard_masks = _harden_mask(occlusion_masks)
+    mask_rgb = _expand_mask(hard_masks, masked_inputs.shape[1])
+    outside_mask_rgb = 1.0 - mask_rgb
+    blended_outputs, raw_outputs = _forward_reconstruction(model, masked_inputs, occlusion_masks, refiner)
 
     abs_error = (blended_outputs - original_targets).abs()
     sq_error = (blended_outputs - original_targets) ** 2
@@ -678,62 +854,101 @@ def _compute_reconstruction_losses(
     masked_mse = _masked_average(sq_error, mask_rgb).mean()
     full_l1 = abs_error.mean()
     full_mse = sq_error.mean()
+    raw_abs_error = (raw_outputs - original_targets).abs()
+    raw_sq_error = (raw_outputs - original_targets) ** 2
+    outside_l1 = _masked_average(raw_abs_error, outside_mask_rgb).mean()
+    outside_mse = _masked_average(raw_sq_error, outside_mask_rgb).mean()
 
     masked_loss = 0.75 * masked_l1 + 0.25 * masked_mse
     full_loss = 0.85 * full_l1 + 0.15 * full_mse
+    outside_loss = 0.85 * outside_l1 + 0.15 * outside_mse
 
     predicted_edges = _gradient_map(blended_outputs)
     target_edges = _gradient_map(original_targets)
     edge_error = (predicted_edges - target_edges).abs()
     masked_edge = _masked_average(edge_error, mask_rgb).mean()
     full_edge = edge_error.mean()
-    edge_loss = 0.72 * masked_edge + 0.28 * full_edge
+    edge_loss = masked_edge
 
-    masked_structure = _ssim_loss(blended_outputs, original_targets, occlusion_masks)
+    predicted_detail = _laplacian_map(blended_outputs)
+    target_detail = _laplacian_map(original_targets)
+    detail_error = (predicted_detail - target_detail).abs()
+    detail_loss = _masked_average(detail_error, mask_rgb).mean()
+
+    masked_structure = _ssim_loss(blended_outputs, original_targets, hard_masks)
     full_structure = _ssim_loss(blended_outputs, original_targets)
-    structure_loss = 0.68 * masked_structure + 0.32 * full_structure
+    structure_loss = masked_structure
 
     reconstructed_full_embedding = recognition_model(_recognizer_input_from_normalized_tensor(blended_outputs))
     with torch.no_grad():
         original_full_embedding = recognition_model(_recognizer_input_from_normalized_tensor(original_targets))
 
-    full_identity_loss = 1.0 - F.cosine_similarity(
+    full_identity_similarity = F.cosine_similarity(
         reconstructed_full_embedding, original_full_embedding, dim=1
     ).mean()
+    full_identity_loss = 1.0 - full_identity_similarity
+
+    teacher_identity_loss = torch.tensor(0.0, device=masked_inputs.device)
+    teacher_identity_similarity = torch.tensor(0.0, device=masked_inputs.device)
+    if teacher_identity_weight > 0.0:
+        teacher_outputs = masked_inputs * (1.0 - mask_rgb) + raw_outputs.detach() * mask_rgb
+        with torch.no_grad():
+            teacher_embedding = recognition_model(_recognizer_input_from_normalized_tensor(teacher_outputs))
+        teacher_identity_similarity = F.cosine_similarity(
+            reconstructed_full_embedding, teacher_embedding, dim=1
+        ).mean()
+        teacher_identity_loss = 1.0 - teacher_identity_similarity
 
     # Perceptual loss: feature-level matching for texture/structure quality
     p_loss = torch.tensor(0.0, device=masked_inputs.device)
     if perceptual_loss_fn is not None and perceptual_weight > 0.0:
-        p_loss = perceptual_loss_fn(blended_outputs, original_targets)
+        masked_perceptual = _masked_perceptual_focus(blended_outputs, original_targets, hard_masks, perceptual_loss_fn)
+        p_loss = masked_perceptual
 
     # Generator adversarial loss: fool the discriminator into accepting
     # the reconstruction as real
     g_adv_loss = torch.tensor(0.0, device=masked_inputs.device)
     if discriminator is not None and adversarial_weight > 0.0:
-        fake_pred = discriminator(blended_outputs)
+        fake_pred = discriminator(_masked_discriminator_view(blended_outputs, original_targets, hard_masks))
         g_adv_loss = F.binary_cross_entropy_with_logits(
             fake_pred, torch.ones_like(fake_pred)
         )
 
+    tv_loss = torch.tensor(0.0, device=masked_inputs.device)
+    if tv_weight > 0.0:
+        tv_loss = _total_variation_loss(blended_outputs, hard_masks)
+
     total_loss = (
         mask_weight * masked_loss
         + full_weight * full_loss
+        + outside_weight * outside_loss
         + identity_weight * full_identity_loss
         + global_identity_weight * full_identity_loss
         + edge_weight * edge_loss
         + structure_weight * structure_loss
         + perceptual_weight * p_loss
         + adversarial_weight * g_adv_loss
+        + tv_weight * tv_loss
+        + detail_weight * detail_loss
+        + teacher_identity_weight * teacher_identity_loss
     )
     metrics = {
         "loss": float(total_loss.detach().item()),
         "masked_l1": float(masked_l1.detach().item()),
         "full_l1": float(full_l1.detach().item()),
+        "outside_l1": float(outside_l1.detach().item()),
+        "outside_preservation": float(outside_loss.detach().item()),
         "edge_loss": float(edge_loss.detach().item()),
         "structure_loss": float(structure_loss.detach().item()),
+        "ssim": float((1.0 - masked_structure.detach()).item()),
         "full_identity": float(full_identity_loss.detach().item()),
+        "identity_similarity": float(full_identity_similarity.detach().item()),
+        "teacher_identity": float(teacher_identity_loss.detach().item()),
+        "teacher_identity_similarity": float(teacher_identity_similarity.detach().item()),
         "perceptual": float(p_loss.detach().item()),
         "g_adv": float(g_adv_loss.detach().item()),
+        "tv": float(tv_loss.detach().item()),
+        "detail": float(detail_loss.detach().item()),
     }
     return total_loss, metrics
 
@@ -751,20 +966,37 @@ def _evaluate_epoch(
     structure_weight: float,
     perceptual_loss_fn: PerceptualLoss | None = None,
     perceptual_weight: float = 0.0,
+    refiner: MTRUNet | None = None,
+    tv_weight: float = 0.0,
+    detail_weight: float = 0.0,
+    outside_weight: float = 1.0,
+    teacher_identity_weight: float = 0.0,
 ) -> dict[str, float]:
     totals = {
         "loss": 0.0,
         "masked_l1": 0.0,
         "full_l1": 0.0,
+        "outside_l1": 0.0,
+        "outside_preservation": 0.0,
         "edge_loss": 0.0,
         "structure_loss": 0.0,
+        "ssim": 0.0,
         "full_identity": 0.0,
+        "identity_similarity": 0.0,
+        "teacher_identity": 0.0,
+        "teacher_identity_similarity": 0.0,
         "perceptual": 0.0,
         "g_adv": 0.0,
+        "tv": 0.0,
+        "detail": 0.0,
     }
     batches = 0
 
+    model_was_training = model.training
+    refiner_was_training = refiner.training if refiner is not None else False
     model.eval()
+    if refiner is not None:
+        refiner.eval()
     with torch.no_grad():
         for masked_inputs, original_targets, occlusion_masks in dataloader:
             masked_inputs = masked_inputs.to(device, non_blocking=True)
@@ -785,12 +1017,22 @@ def _evaluate_epoch(
                 structure_weight,
                 perceptual_loss_fn=perceptual_loss_fn,
                 perceptual_weight=perceptual_weight,
+                refiner=refiner,
+                tv_weight=tv_weight,
+                detail_weight=detail_weight,
+                outside_weight=outside_weight,
+                teacher_identity_weight=teacher_identity_weight,
             )
             for key in totals:
                 totals[key] += metrics.get(key, 0.0)
             batches += 1
 
-    model.train()
+    if refiner is not None:
+        if refiner_was_training:
+            refiner.train()
+        model.eval()
+    elif model_was_training:
+        model.train()
     if batches == 0:
         return totals
     return {key: value / batches for key, value in totals.items()}
@@ -819,17 +1061,33 @@ def train(
     max_extra_originals: int | None,
     perceptual_weight: float = 1.0,
     adversarial_weight: float = 0.1,
+    tv_weight: float = 0.02,
+    detail_weight: float = 0.0,
+    outside_weight: float = 1.0,
+    teacher_identity_weight: float = 0.0,
     disc_lr: float = 1e-4,
     disc_start_epoch: int = 5,
+    use_refiner: bool = False,
+    refiner_resume: str | None = None,
+    refiner_delta_scale: float = 0.75,
+    filter_extra_originals: bool = True,
+    image_size: int = 112,
+    restrict_mouth_chin_mask: bool = MOUTH_CHIN_MASK_RESTRICT_ENABLED_DEFAULT,
+    weights_output_dir: str = "weights",
+    sample_output_dir_override: str | None = None,
+    epoch_offset: int = 0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Starting DEGAN reconstruction training on: {device}")
+    print(f"Starting {'MTR-UNet refiner' if use_refiner else 'DEGAN reconstruction'} training on: {device}")
+    print(f"Reconstruction training resolution: {image_size}x{image_size}")
 
     base_dataset = MaskedFacePairDataset(
         masked_dir, original_dir, mask_threshold=mask_threshold,
         synthetic_probability=0.0, synthetic_mode=synthetic_mode,
         extra_masked_roots=extra_masked_dirs, extra_original_roots=[],
         max_extra_originals=None,
+        image_size=image_size,
+        restrict_mouth_chin_mask=restrict_mouth_chin_mask,
     )
     val_size = max(1, int(len(base_dataset) * val_split))
     if val_size >= len(base_dataset):
@@ -843,13 +1101,19 @@ def train(
         masked_dir, original_dir, mask_threshold=mask_threshold,
         synthetic_probability=synthetic_probability, synthetic_mode=synthetic_mode,
         extra_masked_roots=extra_masked_dirs, extra_original_roots=extra_original_dirs,
-        max_extra_originals=max_extra_originals, indices=train_indices,
+        max_extra_originals=max_extra_originals,
+        filter_extra_originals=filter_extra_originals,
+        indices=train_indices,
+        image_size=image_size,
+        restrict_mouth_chin_mask=restrict_mouth_chin_mask,
     )
     val_dataset = MaskedFacePairDataset(
         masked_dir, original_dir, mask_threshold=mask_threshold,
         synthetic_probability=0.0, synthetic_mode=synthetic_mode,
         extra_masked_roots=extra_masked_dirs, extra_original_roots=[],
         max_extra_originals=None, indices=val_indices,
+        image_size=image_size,
+        restrict_mouth_chin_mask=restrict_mouth_chin_mask,
     )
 
     train_loader = DataLoader(
@@ -863,7 +1127,15 @@ def train(
 
     model = DEGAN().to(device)
     _load_partial_checkpoint(model, resume, device)
-    optimizer_g = optim.Adam(model.parameters(), lr=lr)
+    refiner = MTRUNet(delta_scale=refiner_delta_scale).to(device) if use_refiner else None
+    if refiner is not None:
+        _load_partial_checkpoint(refiner, refiner_resume, device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        optimizer_g = optim.Adam(refiner.parameters(), lr=lr)
+    else:
+        optimizer_g = optim.Adam(model.parameters(), lr=lr)
 
     # Discriminator for adversarial sharpness feedback
     discriminator = PatchDiscriminator(in_channels=3).to(device)
@@ -879,36 +1151,64 @@ def train(
     print(f"Detected {len(base_dataset)} training pairs. Train: {len(train_dataset)}, Val: {len(val_dataset)}.")
     print(f"Loss weights: mask={mask_weight}, full={full_weight}, identity={identity_weight}, "
           f"global_id={global_identity_weight}, edge={edge_weight}, structure={structure_weight}, "
-          f"perceptual={perceptual_weight}, adversarial={adversarial_weight}")
+          f"perceptual={perceptual_weight}, adversarial={adversarial_weight}, tv={tv_weight}, "
+          f"detail={detail_weight}, outside={outside_weight}, teacher_id={teacher_identity_weight}")
+    print(f"Mouth/chin mask restriction: {restrict_mouth_chin_mask}")
+    if refiner is not None:
+        print(f"MTR-UNet residual delta scale: {refiner_delta_scale}")
     print(f"Discriminator starts at epoch {disc_start_epoch + 1}.")
 
-    model.train()
+    if refiner is None:
+        model.train()
+    else:
+        refiner.train()
     best_val_loss = float("inf")
+    sample_output_dir = (
+        Path(sample_output_dir_override)
+        if sample_output_dir_override
+        else Path("outputs/training_samples_refiner" if refiner is not None else "outputs/training_samples")
+    )
+    metrics_log_path = sample_output_dir / "epoch_metrics.jsonl"
+    train_step_log_path = sample_output_dir / "train_step_metrics.jsonl"
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
     for epoch in range(epochs):
+        display_epoch = epoch + 1 + epoch_offset
+        display_total_epochs = epochs + epoch_offset
         running_loss = 0.0
         use_adv = epoch >= disc_start_epoch and adversarial_weight > 0.0
         cur_adv_weight = adversarial_weight if use_adv else 0.0
+        running_metrics = {
+            "loss": 0.0,
+            "discriminator_loss": 0.0,
+            "full_identity": 0.0,
+            "outside_preservation": 0.0,
+            "ssim": 0.0,
+            "identity_similarity": 0.0,
+            "teacher_identity": 0.0,
+            "teacher_identity_similarity": 0.0,
+        }
+        running_batches = 0
 
         for i, (masked_inputs, original_targets, occlusion_masks) in enumerate(train_loader):
             masked_inputs = masked_inputs.to(device, non_blocking=True)
             original_targets = original_targets.to(device, non_blocking=True)
             occlusion_masks = occlusion_masks.to(device, non_blocking=True)
+            d_loss_value = 0.0
 
             # --- Discriminator step ---
             if use_adv:
                 with torch.no_grad():
-                    predicted = model(masked_inputs, occlusion_masks)
-                    mask_rgb = _expand_mask(occlusion_masks.clamp(0.0, 1.0), 3)
-                    fake_imgs = masked_inputs * (1.0 - mask_rgb) + predicted * mask_rgb
+                    fake_imgs, _ = _forward_reconstruction(model, masked_inputs, occlusion_masks, refiner)
                 optimizer_d.zero_grad()
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    real_pred = discriminator(original_targets)
-                    fake_pred = discriminator(fake_imgs.detach())
+                    real_pred = discriminator(_masked_discriminator_view(original_targets, original_targets, occlusion_masks))
+                    fake_pred = discriminator(_masked_discriminator_view(fake_imgs.detach(), original_targets, occlusion_masks))
                     d_loss = 0.5 * (
                         F.binary_cross_entropy_with_logits(real_pred, torch.ones_like(real_pred))
                         + F.binary_cross_entropy_with_logits(fake_pred, torch.zeros_like(fake_pred))
                     )
+                    d_loss_value = float(d_loss.detach().item())
                 scaler.scale(d_loss).backward()
                 scaler.step(optimizer_d)
                 scaler.update()
@@ -916,49 +1216,142 @@ def train(
             # --- Generator step ---
             optimizer_g.zero_grad()
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                loss, _ = _compute_reconstruction_losses(
+                loss, train_metrics = _compute_reconstruction_losses(
                     model, recognition_model, masked_inputs, original_targets, occlusion_masks,
                     mask_weight, full_weight, identity_weight, global_identity_weight,
                     edge_weight, structure_weight,
                     perceptual_loss_fn=perceptual_loss_fn, perceptual_weight=perceptual_weight,
                     discriminator=discriminator if use_adv else None, adversarial_weight=cur_adv_weight,
+                    refiner=refiner, tv_weight=tv_weight, detail_weight=detail_weight,
+                    outside_weight=outside_weight,
+                    teacher_identity_weight=teacher_identity_weight,
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer_g)
             scaler.update()
 
             running_loss += loss.item()
-            if (i + 1) % 20 == 0:
-                print(f"[Epoch {epoch + 1}/{epochs}, Batch {i + 1}/{len(train_loader)}] Loss: {running_loss / 20:.4f}")
+            running_batches += 1
+            running_metrics["loss"] += float(train_metrics["loss"])
+            running_metrics["discriminator_loss"] += d_loss_value
+            running_metrics["full_identity"] += float(train_metrics["full_identity"])
+            running_metrics["outside_preservation"] += float(train_metrics["outside_preservation"])
+            running_metrics["ssim"] += float(train_metrics["ssim"])
+            running_metrics["identity_similarity"] += float(train_metrics["identity_similarity"])
+            running_metrics["teacher_identity"] += float(train_metrics["teacher_identity"])
+            running_metrics["teacher_identity_similarity"] += float(train_metrics["teacher_identity_similarity"])
+            if (i + 1) % 20 == 0 or (i + 1) == len(train_loader):
+                avg_metrics = {key: value / max(1, running_batches) for key, value in running_metrics.items()}
+                current_lr = optimizer_g.param_groups[0]["lr"]
+                print(
+                    f"[Epoch {display_epoch}/{display_total_epochs}, Batch {i + 1}/{len(train_loader)}] "
+                    f"G={avg_metrics['loss']:.4f} "
+                    f"D={avg_metrics['discriminator_loss']:.4f} "
+                    f"id_loss={avg_metrics['full_identity']:.4f} "
+                    f"outside={avg_metrics['outside_preservation']:.4f} "
+                    f"ssim={avg_metrics['ssim']:.4f} "
+                    f"id_sim={avg_metrics['identity_similarity']:.4f} "
+                    f"teacher_id={avg_metrics['teacher_identity']:.4f} "
+                    f"teacher_sim={avg_metrics['teacher_identity_similarity']:.4f} "
+                    f"lr={current_lr:.6g}"
+                )
+                with train_step_log_path.open("a", encoding="utf-8") as train_log:
+                    train_log.write(
+                        json.dumps(
+                            {
+                        "epoch": epoch + 1,
+                        "display_epoch": display_epoch,
+                        "batch": i + 1,
+                                "batches": len(train_loader),
+                                "learning_rate": current_lr,
+                                "adversarial_active": use_adv,
+                                **avg_metrics,
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
                 running_loss = 0.0
+                running_batches = 0
+                running_metrics = {key: 0.0 for key in running_metrics}
 
         val_metrics = _evaluate_epoch(
             model, recognition_model, val_loader, device,
             mask_weight, full_weight, identity_weight, global_identity_weight,
             edge_weight, structure_weight, perceptual_loss_fn, perceptual_weight,
+            refiner=refiner, tv_weight=tv_weight, detail_weight=detail_weight,
+            outside_weight=outside_weight,
+            teacher_identity_weight=teacher_identity_weight,
         )
         print(
-            f"[Epoch {epoch + 1}/{epochs}] "
+            f"[Epoch {display_epoch}/{display_total_epochs}] "
             f"val_loss={val_metrics['loss']:.4f} "
             f"val_l1={val_metrics['masked_l1']:.4f} "
+            f"val_outside={val_metrics['outside_preservation']:.4f} "
             f"val_edge={val_metrics['edge_loss']:.4f} "
             f"val_id={val_metrics['full_identity']:.4f} "
-            f"val_percep={val_metrics['perceptual']:.4f}"
+            f"val_id_sim={val_metrics['identity_similarity']:.4f} "
+            f"val_teacher_id={val_metrics['teacher_identity']:.4f} "
+            f"val_teacher_sim={val_metrics['teacher_identity_similarity']:.4f} "
+            f"val_percep={val_metrics['perceptual']:.4f} "
+            f"val_tv={val_metrics['tv']:.4f} "
+            f"val_detail={val_metrics['detail']:.4f}"
         )
+        with metrics_log_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(
+                json.dumps(
+                    {
+                        "epoch": epoch + 1,
+                        "display_epoch": display_epoch,
+                        "image_size": image_size,
+                        "restrict_mouth_chin_mask": restrict_mouth_chin_mask,
+                        **val_metrics,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
-        weights_dir = Path("weights")
-        weights_dir.mkdir(exist_ok=True)
+        weights_dir = Path(weights_output_dir)
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        if refiner is None:
+            epoch_checkpoint = weights_dir / f"degan_model_epoch_{display_epoch:03d}.pth"
+            torch.save(model.state_dict(), epoch_checkpoint)
+            torch.save(discriminator.state_dict(), weights_dir / f"degan_disc_epoch_{display_epoch:03d}.pth")
+        else:
+            epoch_checkpoint = weights_dir / f"mtr_unet_epoch_{display_epoch:03d}.pth"
+            torch.save(refiner.state_dict(), epoch_checkpoint)
+            torch.save(discriminator.state_dict(), weights_dir / f"mtr_unet_disc_epoch_{display_epoch:03d}.pth")
+        print(f"Saved epoch checkpoint: {epoch_checkpoint}")
+
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            torch.save(model.state_dict(), weights_dir / "degan_model_best.pth")
+            if refiner is None:
+                torch.save(model.state_dict(), weights_dir / "degan_model_best.pth")
+            else:
+                torch.save(refiner.state_dict(), weights_dir / "mtr_unet_best.pth")
             print(f"Saved improved checkpoint.")
 
         # Save visual samples every epoch for tracking reconstruction quality
-        _save_epoch_samples(model, val_loader, device, epoch, Path("outputs/training_samples"))
+        _save_epoch_samples(
+            model,
+            val_loader,
+            device,
+            display_epoch - 1,
+            sample_output_dir,
+            refiner=refiner,
+        )
 
+    weights_dir = Path(weights_output_dir)
+    weights_dir.mkdir(parents=True, exist_ok=True)
     save_path = weights_dir / "degan_model_final.pth"
-    torch.save(model.state_dict(), save_path)
-    torch.save(discriminator.state_dict(), weights_dir / "degan_disc_final.pth")
+    if refiner is None:
+        torch.save(model.state_dict(), save_path)
+        torch.save(discriminator.state_dict(), weights_dir / "degan_disc_final.pth")
+    else:
+        save_path = weights_dir / "mtr_unet_final.pth"
+        torch.save(refiner.state_dict(), save_path)
+        torch.save(discriminator.state_dict(), weights_dir / "mtr_unet_disc_final.pth")
     print(f"Training complete. Weights saved to: {save_path}")
 
 
@@ -971,22 +1364,86 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--mask-weight", type=float, default=4.0)
-    parser.add_argument("--full-weight", type=float, default=2.0)
+    parser.add_argument(
+        "--full-weight",
+        type=float,
+        default=0.0,
+        help="Optional full-image reconstruction term. Keep 0.0 to train reconstruction only inside the mask.",
+    )
     parser.add_argument("--identity-weight", type=float, default=0.2)
     parser.add_argument("--global-identity-weight", type=float, default=1.5)
     parser.add_argument("--edge-weight", type=float, default=1.15)
     parser.add_argument("--structure-weight", type=float, default=0.8)
     parser.add_argument("--perceptual-weight", type=float, default=1.0)
     parser.add_argument("--adversarial-weight", type=float, default=0.1)
+    parser.add_argument("--tv-weight", type=float, default=0.02)
+    parser.add_argument("--detail-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--outside-weight",
+        type=float,
+        default=1.0,
+        help="Penalty for raw generator changes outside the occlusion mask.",
+    )
+    parser.add_argument(
+        "--teacher-identity-weight",
+        type=float,
+        default=0.0,
+        help="Preserve recognition embedding similarity to the frozen DEGAN/backend blend while training a refiner.",
+    )
     parser.add_argument("--disc-lr", type=float, default=1e-4)
     parser.add_argument("--disc-start-epoch", type=int, default=5)
     parser.add_argument("--mask-threshold", type=float, default=0.08)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=112,
+        help="Square reconstruction training size. Use 224 for higher-resolution retraining; must be divisible by 8.",
+    )
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--synthetic-probability", type=float, default=0.80)
     parser.add_argument("--extra-masked", type=str, nargs="*", default=[])
     parser.add_argument("--extra-original", type=str, nargs="*", default=[])
     parser.add_argument("--max-extra-originals", type=int, default=1500)
+    parser.add_argument(
+        "--use-refiner", "--use_refiner",
+        nargs="?", const=True, default=False, type=_str_to_bool,
+        help="Train MTR-UNet after a frozen DEGAN. Accepts true/false or can be used as a flag.",
+    )
+    parser.add_argument("--refiner-resume", type=str, default=None, help="Optional MTR-UNet checkpoint to resume.")
+    parser.add_argument("--refiner-delta-scale", type=float, default=0.75, help="Maximum residual strength for MTR-UNet.")
+    parser.add_argument(
+        "--weights-output-dir",
+        type=str,
+        default="weights",
+        help="Directory for checkpoints written by this run.",
+    )
+    parser.add_argument(
+        "--sample-output-dir",
+        type=str,
+        default=None,
+        help="Optional directory for visual samples and training metric logs.",
+    )
+    parser.add_argument(
+        "--epoch-offset",
+        type=int,
+        default=0,
+        help="Offset used only for naming/logging resumed continuation epochs.",
+    )
+    parser.add_argument(
+        "--filter-extra-originals", "--filter_extra_originals",
+        nargs="?", const=True, default=True, type=_str_to_bool,
+        help="Brightness-filter extra-original datasets before sampling. Disable for already cleaned/aligned datasets.",
+    )
+    parser.add_argument(
+        "--restrict-mouth-chin-mask",
+        "--restrict_mouth_chin_mask",
+        nargs="?",
+        const=True,
+        default=MOUTH_CHIN_MASK_RESTRICT_ENABLED_DEFAULT,
+        type=_str_to_bool,
+        help="Restrict training masks to the central mouth/chin band to exclude neck, clothing, and background.",
+    )
     parser.add_argument("--synthetic-mode", type=str, default="mixed",
         choices=["mixed", "lower-mask", "sunglasses", "opaque-panel", "side-occlusion", "hand", "scarf"])
     args = parser.parse_args()
@@ -998,5 +1455,12 @@ if __name__ == "__main__":
         args.resume, args.synthetic_probability, args.synthetic_mode,
         args.extra_masked, args.extra_original,
         None if args.max_extra_originals is not None and args.max_extra_originals < 0 else args.max_extra_originals,
-        args.perceptual_weight, args.adversarial_weight, args.disc_lr, args.disc_start_epoch,
+        args.perceptual_weight, args.adversarial_weight, args.tv_weight, args.detail_weight,
+        args.outside_weight, args.teacher_identity_weight,
+        args.disc_lr, args.disc_start_epoch, args.use_refiner, args.refiner_resume,
+        args.refiner_delta_scale, args.filter_extra_originals, args.image_size,
+        args.restrict_mouth_chin_mask,
+        args.weights_output_dir,
+        args.sample_output_dir,
+        args.epoch_offset,
     )

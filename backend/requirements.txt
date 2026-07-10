@@ -6,12 +6,11 @@ numpy
 facenet-pytorch
 Pillow
 httpx
+requests
 torch
 torchvision
 scikit-learn
 scikit-image
 matplotlib
-
+tqdm
 lpips
-scikit-learn
-scikit-image

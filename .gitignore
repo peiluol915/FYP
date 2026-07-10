@@ -2,6 +2,8 @@ node_modules/
 build/
 dist/
 coverage/
+tmp/
+output/
 .DS_Store
 *.log
 .env*
@@ -9,8 +11,57 @@ coverage/
 
 # Backend and Data
 /venv/
+/.venv/
 /weights/
 /outputs/
 /database/
 __pycache__/
+**/__pycache__/
 *.pyc
+
+# Frontend build artifacts
+/frontend/node_modules/
+/frontend/dist/
+
+# Generated evaluation/debug outputs
+/evaluation*/
+/backups/
+/backend_blend/
+/frontend_backup/
+/results.csv
+/Source Code/
+/Source Code.zip
+/journal_figures/
+/jiwe_paper_render*/
+/rendered_jiwe*/
+/tools/
+*.jsonl
+*.docx
+~$*.docx
+*.pdf
+*.zip
+*.drawio
+
+# Root-level one-off experiment scripts kept locally but excluded from clean submission
+/debug_*.py
+/compare_*.py
+/*_experiment.py
+/final_evaluate_*.py
+/local_patch_*_experiment.py
+/mouth_chin_algorithm_refiner_experiment.py
+/mtr_refiner_checkpoint_evaluate.py
+/reconstruction_quality_blending_experiment.py
+/update_final_fyp_report.py
+/evaluate.py
+/evaluate_accuracy.py
+/evaluate_lfw15may_original_protocol.py
+
+# Optional one-off LFW protocol reproduction helpers kept local unless requested
+/evaluate_project.py
+/fair_evaluate_lfw_15may.py
+/prepare_lfw15may_original_protocol.py
+/standardize_lfw_15may.py
+
+# Older training wrappers retained locally but not part of the final run recipe
+/backend/run_degan_retrain_strong.ps1
+/backend/run_refiner_vgg_gan.ps1

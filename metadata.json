@@ -1,6 +1,6 @@
 {
-  "name": "Hybrid OAN Dashboard",
-  "description": "Occluded Face Recognition using ResNet-50 and DE-GAN",
+  "name": "Occluded Face Recognition Dashboard",
+  "description": "Mask-restricted DEGAN reconstruction with VGGFace2 gallery recognition",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }

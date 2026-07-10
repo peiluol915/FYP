@@ -47,6 +47,17 @@ except ModuleNotFoundError:
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
+def _str_to_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("Expected true or false.")
+
+
 def _colorize_mask(mask: np.ndarray) -> np.ndarray:
     """Convert a [0,1] float mask to a red-channel heatmap for visualization."""
     mask_u8 = np.clip(mask * 255, 0, 255).astype(np.uint8)
@@ -62,7 +73,7 @@ def _label(img: np.ndarray, text: str) -> np.ndarray:
     return np.vstack([bar, img])
 
 
-def debug_single_image(img_bgr: np.ndarray, output_path: Path, name: str = "sample"):
+def debug_single_image(img_bgr: np.ndarray, output_path: Path, name: str = "sample", use_refiner: bool = False):
     """Run the full pipeline on one image and save a diagnostic grid."""
     analysis = _prepare_face_analysis(img_bgr)
     recon_tensor = analysis["reconstruction_tensor"]
@@ -89,7 +100,10 @@ def debug_single_image(img_bgr: np.ndarray, output_path: Path, name: str = "samp
     # --- Stage 3: Blended output ---
     if is_occluded:
         blended_tensor, blended_rgb = _blend_reconstructed_face(
-            recon_tensor, mask, enhance_patch=True
+            recon_tensor,
+            mask,
+            enhance_patch=not analysis["detected_face"],
+            use_refiner=use_refiner,
         )
     else:
         blended_rgb = recon_rgb
@@ -138,7 +152,7 @@ def debug_single_image(img_bgr: np.ndarray, output_path: Path, name: str = "samp
     return grid
 
 
-def debug_dataset(dataset_path: Path, output_path: Path, limit: int = 5):
+def debug_dataset(dataset_path: Path, output_path: Path, limit: int = 5, use_refiner: bool = False):
     """Run debug visualization on a few samples from a masked dataset."""
     output_path.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -152,7 +166,7 @@ def debug_dataset(dataset_path: Path, output_path: Path, limit: int = 5):
             if img_bgr is None:
                 continue
             name = f"{person_dir.name}_{img_path.stem}"
-            debug_single_image(img_bgr, output_path, name)
+            debug_single_image(img_bgr, output_path, name, use_refiner=use_refiner)
             count += 1
             if count >= limit:
                 return
@@ -164,6 +178,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, help="Path to masked dataset folder")
     parser.add_argument("--limit", type=int, default=5, help="Max samples from dataset")
     parser.add_argument("--output", type=str, default="outputs/debug_pipeline", help="Output directory")
+    parser.add_argument(
+        "--use-refiner", "--use_refiner",
+        nargs="?", const=True, default=False, type=_str_to_bool,
+        help="Visualize DEGAN + MTR-UNet refined output. Accepts true/false or can be used as a flag.",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.output)
@@ -174,13 +193,13 @@ if __name__ == "__main__":
         if img_bgr is None:
             print(f"Error: Cannot read {args.image}")
         else:
-            debug_single_image(img_bgr, out_path, Path(args.image).stem)
+            debug_single_image(img_bgr, out_path, Path(args.image).stem, use_refiner=args.use_refiner)
     elif args.dataset:
-        debug_dataset(Path(args.dataset), out_path, args.limit)
+        debug_dataset(Path(args.dataset), out_path, args.limit, use_refiner=args.use_refiner)
     else:
         # Default: use processed_lfw
         default_ds = Path("database/processed_lfw")
         if default_ds.exists():
-            debug_dataset(default_ds, out_path, args.limit)
+            debug_dataset(default_ds, out_path, args.limit, use_refiner=args.use_refiner)
         else:
             print("Provide --image or --dataset. Run from project root.")

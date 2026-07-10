@@ -1,30 +1,66 @@
 # Architecture Overview
 
-This project implements an end-to-end occluded face recognition and reconstruction system, primarily built with PyTorch, FastAPI, and React.
+This project implements an end-to-end occluded face reconstruction and
+recognition system with a PyTorch/FastAPI backend and a React/Vite frontend.
 
-## System Components
+## 1. Frontend
 
-### 1. Frontend (React + Vite)
-- **App.tsx**: A single-page application that allows users to upload masked images.
-- **Integration**: Communicates with the FastAPI backend via REST API (`/analyze`).
-- **UI/UX**: Displays a side-by-side comparison of the occluded input, reconstructed face, and original reference face (if identity is recognized).
+`frontend/src/App.tsx` is a single-page upload and comparison interface. It
+posts images to the backend `POST /analyze` endpoint, then displays:
 
-### 2. Backend (FastAPI)
-- **main.py**: The entry point for inference. It exposes an `/analyze` endpoint that:
-  1. Detects faces using MTCNN.
-  2. Estimates occlusion severity and region.
-  3. Reconstructs the unoccluded face using the DEGAN generator.
-  4. Extracts embeddings using either the OAN backbone or InceptionResnetV1.
-  5. Matches the embedding against a pre-computed gallery (`gallery_index.pt`).
+- the occluded input,
+- the detected occlusion mask,
+- the raw DEGAN output,
+- the final mask-restricted reconstruction,
+- input and reconstructed recognition candidates,
+- similarity, confidence, and decision metrics.
 
-### 3. Deep Learning Models (PyTorch)
-- **OAN (Occlusion Aware Network)**: A ResNet-50 based classification backbone equipped with an OAM (Occlusion Aware Module) attention mechanism.
-- **DEGAN (Reconstruction GAN)**: A U-Net style architecture with residual bottleneck blocks that reconstructs occluded facial regions.
-- **MTCNN**: Used for robust face detection and alignment.
-- **InceptionResnetV1 (VGGFace2)**: Used for identity-preserving losses and high-accuracy embedding matching.
+The frontend probes local backend ports in this order: `8011`, `8001`, `8000`.
 
-### 4. Data Processing & Training
-- **dataset_masker.py**: A robust pipeline to synthesize complex occlusions (masks, sunglasses, hands, scarves) on unoccluded datasets.
-- **train_reconstruction.py**: The training loop for DEGAN. It implements identity-preserving losses, perceptual edge losses, and SSIM to ensure realistic reconstructions.
-- **train.py**: The training loop for the OAN classification model.
-- **evaluate.py**: Inference evaluation script measuring MSE, PSNR, and Top-1 Accuracy.
+## 2. Backend
+
+`backend/main.py` is the active inference service. It provides:
+
+- `POST /analyze` - full reconstruction and recognition pipeline.
+- `POST /reconstruct` - reconstruction-only output.
+- `POST /recognize` - recognition-only output.
+- `POST /refresh-gallery` - rebuilds the cached gallery embeddings.
+
+The backend can also serve the built frontend from `frontend/dist` when that
+folder exists.
+
+## 3. Inference Pipeline
+
+1. MTCNN detects and aligns the uploaded face.
+2. Heuristic mask estimation identifies lower-face and panel-style occlusions.
+3. DEGAN reconstructs the occluded facial region.
+4. Guard logic composites reconstruction only inside the accepted mask.
+5. VGGFace2 FaceNet embeddings are extracted with
+   `InceptionResnetV1(pretrained="vggface2")`.
+6. The embedding is matched against `weights/gallery_index.pt` with k-NN
+   scoring.
+7. If reconstructed recognition is not clearly better, the safer original-input
+   recognition result is kept.
+
+## 4. Models
+
+- **DEGAN**: U-Net style generator with gated input convolution, residual
+  bottleneck blocks, skip connections, and CBAM attention.
+- **MTR-UNet**: Optional residual texture refiner. The backend loads it when
+  weights are available but may skip it when guard logic predicts identity or
+  artifact risk.
+- **InceptionResnetV1 (VGGFace2)**: Active embedding model for gallery
+  recognition and identity-preserving reconstruction losses.
+- **OAN**: Older occlusion-aware baseline model retained for comparison and
+  disabled experimental fusion. It is not the default recognizer.
+
+## 5. Training And Evaluation
+
+- `backend/train_reconstruction.py` trains DEGAN and, optionally, MTR-UNet and a
+  PatchGAN discriminator.
+- `backend/train.py` reproduces the older OAN baseline.
+- `backend/dataset_masker.py` creates synthetic occlusions for reconstruction
+  and recognition experiments.
+- `backend/evaluate.py`, `backend/ablation_evaluate.py`, and
+  `backend/evaluate_checkpoint.py` provide evaluation and checkpoint comparison
+  utilities.

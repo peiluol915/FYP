@@ -293,3 +293,97 @@ class DEGAN(nn.Module):
         dec1 = self.up1(dec2)
         dec1 = self.dec1(self.skip_attn1(torch.cat([dec1, enc1], dim=1)))
         return self.output(dec1)
+
+
+class MTRUNet(nn.Module):
+    """Mask-Aware Texture Refinement U-Net.
+
+    This lightweight residual refiner runs after DEGAN. It receives the occluded
+    face, the DEGAN output, and a single-channel occlusion mask, predicts a small
+    residual texture delta, and blends only the masked region back into the
+    original input.
+    """
+
+    def __init__(self, base_channels: int = 32, delta_scale: float = 0.75):
+        super().__init__()
+        self.delta_scale = delta_scale
+        self.enc1 = GatedConv2d(7, base_channels)
+        self.enc1_refine = ConvBlock(base_channels, base_channels)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = ConvBlock(base_channels, base_channels * 2)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.pool3 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            ConvBlock(base_channels * 4, base_channels * 4),
+            ResidualBlock(base_channels * 4),
+        )
+
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels * 4),
+            nn.ReLU(inplace=True),
+        )
+        self.dec3 = ConvBlock(base_channels * 8, base_channels * 2)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+        )
+        self.dec2 = ConvBlock(base_channels * 4, base_channels)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+        self.delta_head = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, 3, kernel_size=1),
+            nn.Tanh(),
+        )
+
+    def forward(
+        self,
+        occluded_face: torch.Tensor,
+        degan_output: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        return_delta: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if mask.shape[1] != 1:
+            mask = mask.mean(dim=1, keepdim=True)
+        mask = mask.clamp(0.0, 1.0)
+        hard_mask = F.max_pool2d((mask > 0.03).to(mask.dtype), kernel_size=7, stride=1, padding=3)
+        hard_mask = F.max_pool2d(hard_mask, kernel_size=5, stride=1, padding=2)
+        context_face = occluded_face * (1.0 - hard_mask) + degan_output.detach() * hard_mask
+        x = torch.cat([context_face, degan_output, hard_mask], dim=1)
+
+        enc1 = self.enc1_refine(self.enc1(x))
+        enc2 = self.enc2(self.pool1(enc1))
+        enc3 = self.enc3(self.pool2(enc2))
+        bottleneck = self.bottleneck(self.pool3(enc3))
+
+        dec3 = self.up3(bottleneck)
+        if dec3.shape[-2:] != enc3.shape[-2:]:
+            dec3 = F.interpolate(dec3, size=enc3.shape[-2:], mode="bilinear", align_corners=False)
+        dec3 = self.dec3(torch.cat([dec3, enc3], dim=1))
+        dec2 = self.up2(dec3)
+        if dec2.shape[-2:] != enc2.shape[-2:]:
+            dec2 = F.interpolate(dec2, size=enc2.shape[-2:], mode="bilinear", align_corners=False)
+        dec2 = self.dec2(torch.cat([dec2, enc2], dim=1))
+        dec1 = self.up1(dec2)
+        if dec1.shape[-2:] != enc1.shape[-2:]:
+            dec1 = F.interpolate(dec1, size=enc1.shape[-2:], mode="bilinear", align_corners=False)
+        dec1 = self.dec1(torch.cat([dec1, enc1], dim=1))
+
+        delta = self.delta_head(dec1) * self.delta_scale
+        refined = (degan_output + delta).clamp(-1.0, 1.0)
+        final = occluded_face * (1.0 - hard_mask) + refined * hard_mask
+        if return_delta:
+            return final, delta
+        return final

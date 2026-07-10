@@ -165,10 +165,28 @@ body {
 }
 
 .upload-dropzone span,
+.toggle-row span,
 .status-box span,
 .image-card-copy p {
   color: rgba(234, 233, 226, 0.7);
   line-height: 1.5;
+}
+
+.toggle-row {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 10px 2px;
+  cursor: pointer;
+}
+
+.toggle-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: #f2a84c;
+  flex: 0 0 auto;
 }
 
 .status-box {
@@ -197,6 +215,39 @@ body {
   display: flex;
   gap: 12px;
   align-items: center;
+}
+
+.match-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.match-list {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.match-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  color: rgba(234, 233, 226, 0.82);
+  font-size: 0.86rem;
+}
+
+.match-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.match-row strong {
+  flex: 0 0 auto;
 }
 
 .gallery-panel {
@@ -270,6 +321,10 @@ body {
   }
 
   .score-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .match-grid {
     grid-template-columns: 1fr;
   }
 }
